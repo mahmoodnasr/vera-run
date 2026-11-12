@@ -1,0 +1,6 @@
+{
+  "name": "vera-run-action",
+  "private": true,
+  "type": "module",
+  "description": "GitHub Action: run Vera E2E tests from CI (zero dependencies, node24)"
+}

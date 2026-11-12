@@ -1,0 +1,107 @@
+# vera-run — run your Vera E2E tests from CI and gate the PR on real failures.
+#
+# Published as `mahmoodnasr/vera-run@v1`. That public repository is a release
+# copy of this directory — change it here, then copy and re-tag. Quarantined tests
+# and passed-on-retry flakes are reported as warnings, never as failures,
+# unless you opt in via fail-on-flaky. A run that went green only after
+# self-heal rewrote a selector is reported the same way — see fail-on-healed,
+# and read its description: that outcome is not one a CI-started run can
+# produce today, so the input is inert. fail-on-flaky is unaffected.
+name: 'Vera Run'
+description: 'Run your Vera E2E suite against a preview/staging URL and gate the PR on real failures'
+branding:
+  icon: 'check-circle'
+  color: 'purple'
+
+inputs:
+  api-url:
+    description: 'Base URL of your Vera deployment (e.g. https://vera.example.com)'
+    required: true
+  api-token:
+    description: 'Vera CI token (vera_…). Store it as a repository secret.'
+    required: true
+  project:
+    description: 'Vera project id to run'
+    required: true
+  test:
+    description: 'Run a single test by id (default: all tests in the project)'
+    required: false
+  suite:
+    description: 'Run a suite by id (default: all tests in the project)'
+    required: false
+  environment:
+    description: 'Named Vera environment profile to run against (e.g. staging)'
+    required: false
+  preview-url:
+    description: >-
+      Deployment URL to test — typically the PR's preview deploy. Overrides the
+      environment/project base URL. When omitted, common provider variables are
+      used if present: VERCEL_URL, DEPLOY_PRIME_URL (Netlify), DEPLOY_URL.
+    required: false
+  fail-on-flaky:
+    description: 'Also fail the job when tests passed only on retry (default: warn)'
+    required: false
+    default: 'false'
+  fail-on-healed:
+    description: >-
+      Also fail the job when a test passed only after self-heal rewrote a
+      selector (default: warn). Healing never touches the expectation, so the
+      assertion still held — but the step may no longer be driving the control
+      it was written for, which a pass/fail column cannot show you.
+
+      Inert today, and worth knowing before you rely on it: the run this
+      action starts executes cloud-side (the Vera server or its worker,
+      whatever the project's runTarget) with no selector healer attached — so
+      `healed` comes back 0 here and this input cannot fail a job.
+      Runs that CAN heal are never started by this action: vera-agent runs
+      when an org admin has turned on `settings.agent.selfHeal` (including
+      `vera check --run --local` in a CI job, which gates on a heal with its
+      own `--fail-on-healed`), and the repair and AI-generation surfaces. The input is kept
+      and covered by the gating-parity suite so that setting it now takes
+      effect the day a CI-started run can heal. `fail-on-flaky` is unaffected
+      and gates today exactly as described.
+    required: false
+    default: 'false'
+  fail-on-unrun-critical:
+    description: >
+      Fail the job when a test whose inherited risk band is p0/p1 did NOT run in
+      this invocation. Off by default. Zero — and therefore inert — until the
+      project has approved risk assessments, so enabling it on an unscored
+      project changes nothing.
+    required: false
+    default: 'false'
+
+outputs:
+  status:
+    description: >-
+      The GATE's verdict: passed | failed. Deliberately two-valued — a run that
+      reached no verdict at all (cancelled, or still running) fails the job and
+      reports `failed` here, with `incomplete` beside it saying which. Widening
+      this would break every workflow that branches on it.
+  report-url:
+    description: 'Link to the run report in the Vera dashboard'
+  passed:
+    description: 'Number of passed tests'
+  failed:
+    description: 'Number of failed tests (including quarantined failures)'
+  quarantined-failed:
+    description: 'Failures from quarantined tests (reported, never gating)'
+  passed-on-retry:
+    description: 'Tests that passed only on a retry (flaky)'
+  healed:
+    description: >-
+      Tests that passed only after a selector was healed. Always 0 today — the
+      server and worker that execute a CI-started run attach no healer; only
+      vera-agent runs with `settings.agent.selfHeal` on, and the repair and
+      AI-generation surfaces, heal (see fail-on-healed).
+  incomplete:
+    description: >-
+      `1` when the run reached no verdict at all — cancelled, or still running
+      when the response was written — and `0` otherwise. Such a run fails the
+      job, but for a different reason than a failing test, and `status` alone
+      cannot tell you which. Single-test runs only: a batch response folds a
+      cancelled member into `failed` and carries no count to separate out.
+
+runs:
+  using: 'node24'
+  main: 'index.js'
