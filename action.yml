@@ -70,6 +70,16 @@ inputs:
       project changes nothing.
     required: false
     default: 'false'
+  request-timeout-seconds:
+    description: >-
+      How long any one HTTP call to Vera may take, in seconds. The run is
+      started without waiting, each run is then long-polled (the server holds a
+      poll for up to a minute), and the verdict is collected once every run has
+      finished — so no call needs long. A call that times out, or meets a 5xx,
+      a 429 or a concurrent-run limit, is retried under the same
+      Idempotency-Key, which never starts a second set of runs.
+    required: false
+    default: '120'
 
 outputs:
   status:
@@ -94,6 +104,12 @@ outputs:
       server and worker that execute a CI-started run attach no healer; only
       vera-agent runs with `settings.agent.selfHeal` on, and the repair and
       AI-generation surfaces, heal (see fail-on-healed).
+  unrun-critical:
+    description: >-
+      Tests whose inherited risk band is p0/p1 that this job did NOT run (see
+      fail-on-unrun-critical). Always 0 for a single-test run, and 0 until the
+      project has approved risk assessments. The shell gate reports the same
+      count as VERA_UNRUN_CRITICAL.
   incomplete:
     description: >-
       `1` when the run reached no verdict at all — cancelled, or still running

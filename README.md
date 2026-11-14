@@ -53,12 +53,18 @@ your AI-generated suite runs against every preview deploy.
 | `preview-url` | | Deployment URL to test (overrides base URL) |
 | `fail-on-flaky` | | `'true'` to fail when tests passed only on retry |
 | `fail-on-healed` | | `'true'` to fail when a test passed only after self-heal rewrote a selector. **Inert today** — see [Green is not one thing](#green-is-not-one-thing) |
+| `fail-on-unrun-critical` | | `'true'` to fail when a test whose inherited risk band is p0/p1 did not run in this invocation. Inert until the project has approved risk assessments |
+| `request-timeout-seconds` | | How long any one HTTP call may take (default `120`) |
 
 ## Outputs
 
 `status`, `report-url`, `passed`, `failed`, `quarantined-failed`,
-`passed-on-retry`, `healed`, `incomplete`. (`healed` is always `0` today — see
-below.)
+`passed-on-retry`, `healed`, `unrun-critical`, `incomplete`. (`healed` is always
+`0` today — see below.)
+
+`unrun-critical` counts the tests whose inherited risk band is p0/p1 that this
+job did not run (the count `fail-on-unrun-critical` gates on). It is `0` for a
+single-test run, and `0` until the project has approved risk assessments.
 
 `status` is the **gate's** verdict and stays two-valued (`passed` | `failed`).
 `incomplete` is `1` when the run reached no verdict at all — someone stopped it,
@@ -72,6 +78,18 @@ a failure nobody observed.
   a run that reached **no verdict** — a cancellation is not a pass, and letting
   it through would turn stopping a run into a way to merge.
 - A revoked or invalid token fails the job securely (no retry, nothing echoed).
+- **No long-held connection.** The action starts the run with `wait: false`,
+  long-polls each run at `/api/v1/runs/:id/wait`, then re-sends the request
+  with the same `Idempotency-Key` and `wait: true` to collect the verdict for
+  exactly those runs. A suite that runs for half an hour is therefore not cut
+  off by Node's 300-second headers timeout, a proxy, or a Vera deploy.
+- **Retries never start a second set of runs.** Every call carries one
+  `Idempotency-Key`. A timeout, a reset or a 5xx is retried (8 attempts — long
+  enough to ride out a deploy), and so are a 429 and a 403 `plan_limit` on
+  `maxConcurrentRuns` / `queuedRuns` — the workspace is at its run limit, which
+  clears as runs finish — each after the server's `Retry-After`, else a capped
+  exponential backoff. Each retry is logged. Any other `plan_limit` fails at
+  once. The whole exchange is bounded at 60 minutes.
 - Quarantined failures, retry-flakes and healed passes produce `::warning::`
   annotations and a job-summary table with a link to the Vera report.
 

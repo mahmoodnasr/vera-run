@@ -3,6 +3,7 @@
 // only: quarantined-test failures and passed-on-retry flakes surface as
 // warnings (annotations + job summary), never disappear, and never fail the
 // job unless fail-on-flaky is set.
+import { randomUUID } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
 
 const input = (name) =>
@@ -56,32 +57,8 @@ async function main() {
       (previewUrl ? ` against ${previewUrl}` : ''),
   );
 
-  let res;
-  try {
-    // The run executes synchronously server-side; the response carries the
-    // terminal result (typically a few minutes for a suite).
-    res = await fetch(`${apiUrl}/api/v1/projects/${encodeURIComponent(project)}/run`, {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-  } catch (err) {
-    fail(`vera-run: could not reach ${apiUrl} — ${err?.message ?? err}`);
-    return;
-  }
-
-  if (res.status === 401) {
-    // Revoked/invalid token: fail securely without echoing anything sensitive.
-    fail('vera-run: the Vera API token was rejected (invalid or revoked).');
-    return;
-  }
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    fail(`vera-run: run failed to start (HTTP ${res.status}) ${text}`);
-    return;
-  }
-
-  const r = await res.json();
+  const r = await startAndAwaitRun(apiUrl, token, project, body);
+  if (!r) return;
   const isSingle = Boolean(body.testId);
   const passed = isSingle ? (r.status === 'passed' ? 1 : 0) : (r.passed ?? 0);
   const failed = isSingle ? (r.status === 'failed' ? 1 : 0) : (r.failed ?? 0);
@@ -105,7 +82,7 @@ async function main() {
   // already correct the day a CI-started run can heal. fail-on-flaky is not
   // affected: retries happen on every run.
   const healed = isSingle ? (r.healed ? 1 : 0) : (r.healed ?? 0);
-  // B3.9 — critical tests this job did NOT run. A single-test invocation makes
+  // Critical tests this job did NOT run. A single-test invocation makes
   // no claim about project-wide coverage (you asked for one test and got one),
   // so it is 0 there; gating `--test` on other tests not running would make it
   // unusable in CI.
@@ -124,7 +101,7 @@ async function main() {
   const blocking = isSingle ? r.blocking : r.blockingFailed > 0;
   const status = blocking ? 'failed' : 'passed';
 
-  // S3.97 — a run can be NEITHER passed nor failed. `passed` and `failed` above
+  // A run can be NEITHER passed nor failed. `passed` and `failed` above
   // are both derived from `status`, so a run somebody stopped came out as
   // "0 passed, 0 failed" and then, from the gate, as "the test failed". The
   // exit code was right both times — `blocking` decides that, and a
@@ -192,7 +169,7 @@ async function main() {
     `## Vera E2E — ${status === 'passed' ? '✅ passed' : '❌ failed'}\n\n` +
       `| Passed | Failed | Quarantined failures | Passed on retry | Passed on heal |\n|---|---|---|---|---|\n` +
       `| ${passed} | ${failed} | ${quarantinedFailed} | ${passedOnRetry} | ${healed} |\n\n` +
-      // S3.97 — the table is five counts, and a run that reached no verdict is
+      // The table is five counts, and a run that reached no verdict is
       // in none of them, so it would read as an all-zero row. It is stated in
       // prose beneath rather than as a sixth column: a column would be 0 on
       // every run anyone ever sees, and the panel is the surface a person looks
@@ -205,7 +182,7 @@ async function main() {
   );
 
   if (blocking) {
-    // Same exit code, true sentence (S3.97). A run that reached no verdict is
+    // Same exit code, true sentence. A run that reached no verdict is
     // red for a different reason than a failing one, and the exit code cannot
     // carry the difference — so the annotation does. "the test failed" about a
     // run nobody ever got an answer from sends a reader looking for a broken
@@ -226,6 +203,235 @@ async function main() {
       `Vera: ${unrunCritical} critical test(s) did not run and fail-on-unrun-critical is enabled. ${r.reportUrl ?? ''}`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Transport: start, poll, answer.
+//
+// The run is started with `wait: false`, so the server answers as soon as the
+// runs are dispatched; each run is then long-polled at /runs/:id/wait (the
+// server holds each poll for up to a minute); and once every run is terminal
+// the same request is sent again, with the same Idempotency-Key and
+// `wait: true`, which returns the verdict for exactly those runs. No call
+// holds a connection for much more than a minute, so neither a proxy, Node's
+// own 300 s headers timeout nor a server deploy can cut a long run off — and
+// because every call carries the key, retrying any of them never starts a
+// second set of runs.
+//
+// The verdict is the SERVER's. This file never decides `blocking` itself; it
+// reads it off the final answer exactly as it did when that answer came back
+// from one long request. A server that answers the first request with the
+// verdict straight away (201) — one that runs tests in its own process, or
+// one that predates `wait` — is read the same way.
+// ---------------------------------------------------------------------------
+
+/** How long the whole start-poll-answer exchange may take. */
+const RUN_DEADLINE_MS = 60 * 60_000;
+/** Attempts per call, whatever the server's Retry-After says. */
+const MAX_ATTEMPTS = 240;
+/** Attempts per call that got no answer or a 5xx. */
+const MAX_FAULT_ATTEMPTS = 8;
+const TERMINAL = new Set(['passed', 'failed', 'cancelled']);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * A refusal that clears by itself as runs finish: the workspace is at its
+ * concurrent-run limit, or its queue is full. Any other plan_limit (a feature
+ * the plan lacks, a project cap) is a plan fact, and retrying cannot fix it.
+ */
+function isRunSlotRefusal(status, json) {
+  return (
+    status === 403 &&
+    json?.code === 'plan_limit' &&
+    (json.limitKey === 'maxConcurrentRuns' || json.limitKey === 'queuedRuns')
+  );
+}
+
+/** Retry-After when the server sent one, else capped exponential backoff. */
+function retryDelayMs(res, attempt) {
+  const header = res?.headers?.get('retry-after')?.trim();
+  if (header && /^\d+$/.test(header)) return Math.min(Number(header), 60) * 1000;
+  return Math.min(60_000, 2_000 * 2 ** attempt);
+}
+
+/** A connection that dropped or stalled: worth another attempt. */
+const DROPPED = new Set([
+  'ECONNRESET',
+  'ECONNABORTED',
+  'EPIPE',
+  'ETIMEDOUT',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CLOSED',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+]);
+/** Nothing listening at the address, or no such host: a wrong URL — unless the
+ *  server just accepted the run, in which case it is restarting. */
+const UNREACHABLE = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH']);
+
+/** Is a call that got no response worth repeating? Anything unrecognised is not. */
+function retryableNoAnswer(error, afterStart) {
+  if (error?.name === 'TimeoutError' || error?.name === 'AbortError') return true;
+  const code = error?.cause?.code;
+  return DROPPED.has(code) || (afterStart === true && UNREACHABLE.has(code));
+}
+
+/**
+ * One call, retried while the answer is one that clears with time: no answer
+ * at all (a timeout, a reset during a deploy), 5xx, 429, a concurrent request
+ * with the same key still starting, or the run-slot refusal above. Faults (no
+ * answer, 5xx) get MAX_FAULT_ATTEMPTS — long enough to ride out a deploy, short
+ * enough that a broken server fails the job in minutes, not an hour. A
+ * connection nobody accepts is retried only once the run exists (`afterStart`):
+ * before that it means the URL is wrong (see `retryableNoAnswer`). Returns the
+ * last response; throws only when no response ever arrived.
+ */
+async function callWithRetries(url, init, { deadline, requestTimeoutMs, what, afterStart }) {
+  let faults = 0;
+  for (let attempt = 0; ; attempt++) {
+    let res;
+    let json = null;
+    let text = '';
+    let error;
+    try {
+      res = await fetch(url, { ...init, signal: AbortSignal.timeout(requestTimeoutMs) });
+      text = await res.text();
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {
+        json = null;
+      }
+    } catch (err) {
+      error = err;
+    }
+    const fault = error !== undefined || res.status >= 500;
+    const later =
+      !fault &&
+      (res.status === 429 ||
+        (res.status === 409 && json?.code === 'idempotency_in_progress') ||
+        isRunSlotRefusal(res.status, json));
+    if (!fault && !later) return { res, json, text };
+    if (error !== undefined && !retryableNoAnswer(error, afterStart)) throw error;
+    if (fault) faults++;
+    const delay = retryDelayMs(res, attempt);
+    if (
+      faults >= MAX_FAULT_ATTEMPTS ||
+      attempt + 1 >= MAX_ATTEMPTS ||
+      Date.now() + delay > deadline
+    ) {
+      if (error !== undefined) throw error;
+      return { res, json, text };
+    }
+    const seconds = Math.round(delay / 1000);
+    if (error === undefined && isRunSlotRefusal(res.status, json)) {
+      console.log(
+        `Vera: the workspace is at its run limit (${json.error ?? json.limitKey}) — ` +
+          `retrying ${what} in ${seconds}s.`,
+      );
+    } else {
+      const why =
+        error !== undefined ? `no answer (${error?.message ?? error})` : `HTTP ${res.status}`;
+      console.log(`Vera: ${what} got ${why} — retrying in ${seconds}s (attempt ${attempt + 2}).`);
+    }
+    await sleep(delay);
+  }
+}
+
+/**
+ * Start the run and return the server's final answer, or null after reporting
+ * why there is none. Every failure here fails the job closed.
+ */
+async function startAndAwaitRun(apiUrl, token, project, body) {
+  const runUrl = `${apiUrl}/api/v1/projects/${encodeURIComponent(project)}/run`;
+  const requestTimeoutMs = Math.max(1, Number(input('request-timeout-seconds')) || 120) * 1000;
+  const deadline = Date.now() + RUN_DEADLINE_MS;
+  const headers = {
+    authorization: `Bearer ${token}`,
+    'content-type': 'application/json',
+    // One key per job attempt: every retry below is the SAME request, and a
+    // re-run of the job is deliberately a new one.
+    'idempotency-key': randomUUID(),
+  };
+  const opts = (what, afterStart) => ({ deadline, requestTimeoutMs, what, afterStart });
+  const post = (wait, what) =>
+    callWithRetries(
+      runUrl,
+      { method: 'POST', headers, body: JSON.stringify({ ...body, wait }) },
+      opts(what, wait),
+    );
+
+  const refused = (res, text, doing) => {
+    if (res.status === 401) {
+      // Revoked/invalid token: fail securely without echoing anything sensitive.
+      fail('vera-run: the Vera API token was rejected (invalid or revoked).');
+    } else {
+      fail(`vera-run: ${doing} (HTTP ${res.status}) ${text}`);
+    }
+    return null;
+  };
+
+  let started;
+  try {
+    started = await post(false, 'starting the run');
+  } catch (err) {
+    fail(`vera-run: could not reach ${apiUrl} — ${err?.message ?? err}`);
+    return null;
+  }
+  if (!started.res.ok) return refused(started.res, started.text, 'run failed to start');
+  if (started.res.status !== 202) {
+    if (!started.json) throw new Error('Vera returned a response this action cannot read.');
+    return started.json;
+  }
+
+  const runIds = Array.isArray(started.json?.runIds) ? started.json.runIds : [];
+  const reportUrl = started.json?.reportUrl ?? '';
+  console.log(`Vera started ${runIds.length} run(s); waiting for them to finish.`);
+  let finished = 0;
+  for (const runId of runIds) {
+    for (;;) {
+      if (Date.now() > deadline) {
+        fail(
+          `Vera: the runs did not finish within ${RUN_DEADLINE_MS / 60_000} minutes — no verdict ` +
+            `was reached, so the build is gated. They may still be running: ${reportUrl}`,
+        );
+        return null;
+      }
+      let polled;
+      try {
+        polled = await callWithRetries(
+          `${apiUrl}/api/v1/runs/${encodeURIComponent(runId)}/wait`,
+          { headers: { authorization: headers.authorization } },
+          opts(`waiting on run ${runId}`, true),
+        );
+      } catch (err) {
+        fail(
+          `vera-run: lost contact with ${apiUrl} while waiting — ${err?.message ?? err}. ` +
+            `The runs may still be running: ${reportUrl}`,
+        );
+        return null;
+      }
+      if (polled.res.status === 202) continue;
+      if (!polled.res.ok) return refused(polled.res, polled.text, `could not read run ${runId}`);
+      if (TERMINAL.has(polled.json?.status)) break;
+    }
+    finished++;
+    console.log(`Vera: ${finished}/${runIds.length} run(s) finished.`);
+  }
+
+  let answer;
+  try {
+    answer = await post(true, 'collecting the result');
+  } catch (err) {
+    fail(`vera-run: could not collect the result from ${apiUrl} — ${err?.message ?? err}`);
+    return null;
+  }
+  if (!answer.res.ok || answer.res.status === 202) {
+    return refused(answer.res, answer.text, 'could not collect the result');
+  }
+  if (!answer.json) throw new Error('Vera returned a response this action cannot read.');
+  return answer.json;
 }
 
 main().catch((err) => fail(`vera-run: unexpected error — ${err?.stack ?? err}`));
